@@ -8,6 +8,7 @@ import { BotAvatar } from './BotAvatar'
 import { MessageCard, MarkdownContent } from './MarkdownContent'
 import type { ToolActivity } from '../App'
 import { applySlashCompletion } from '../slash-routing'
+import { attachmentId, formatFileSize } from '../attachment-routing'
 import { formatResponseStats } from '../message-stats'
 import { isExpectedVoiceCleanupError, VOICE_AUTOSEND_HOLD_MS } from '../voice-input'
 import { useEdgeSwipeBack } from '../edge-swipe'
@@ -54,8 +55,6 @@ const toDataUrl = (file: File): Promise<string> => new Promise((resolve, reject)
   reader.readAsDataURL(file)
 })
 
-const attachmentId = (file: File) => `${file.name}:${file.size}:${file.lastModified}`
-const formatFileSize = (size: number) => size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / (1024 * 1024)).toFixed(1)} MB`
 const maxAttachmentBytes = 50 * 1024 * 1024
 
 export function ChatView({ session, conversationLoading, messages, settledAssistant, profiles, draft, setDraft, mentions, streaming, sending, toolActivities, error, back, refresh, openProfile, onSessionModelChange, submit, submitVoice, stop }: Props) {
@@ -91,6 +90,8 @@ export function ChatView({ session, conversationLoading, messages, settledAssist
   const holdTimerRef = useRef<number | null>(null)
   const ignoreMicClickRef = useRef(false)
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
+  const attachmentFilesRef = useRef(new Map<string, File>())
+  const retryingRef = useRef(new Set<string>())
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [pullDistance, setPullDistance] = useState(0)
   const [pullRefreshing, setPullRefreshing] = useState(false)
@@ -128,6 +129,8 @@ export function ChatView({ session, conversationLoading, messages, settledAssist
   useEffect(() => {
     setAttachments([])
     setDraggingFiles(false)
+    attachmentFilesRef.current.clear()
+    retryingRef.current.clear()
   }, [session.id])
 
   useLayoutEffect(() => {
@@ -400,15 +403,30 @@ export function ChatView({ session, conversationLoading, messages, settledAssist
       if (file.size > maxAttachmentBytes) throw new Error(`Files must be 50 MB or smaller (${file.name} is ${formatFileSize(file.size)}).`)
       const dataUrl = await toDataUrl(file)
       const uploaded = await attachFile(session.id, session.profile, { name: file.name, dataUrl })
+      attachmentFilesRef.current.delete(id)
       setAttachments(items => items.map(item => item.id === id ? { ...item, name: uploaded.name, status: 'ready', refText: uploaded.refText, error: undefined } : item))
     } catch (reason) {
       setAttachments(items => items.map(item => item.id === id ? { ...item, status: 'error', error: reason instanceof Error ? reason.message : 'Hermes could not upload this file.' } : item))
     }
   }
+  const removeAttachment = (id: string) => {
+    attachmentFilesRef.current.delete(id)
+    retryingRef.current.delete(id)
+    setAttachments(items => items.filter(current => current.id !== id))
+  }
+  const retryAttachment = (id: string) => {
+    if (retryingRef.current.has(id)) return
+    const file = attachmentFilesRef.current.get(id)
+    if (!file) return
+    retryingRef.current.add(id)
+    setAttachments(items => items.map(item => item.id === id && item.status === 'error' ? { ...item, status: 'uploading', error: undefined } : item))
+    void uploadAttachment(file, id).finally(() => { retryingRef.current.delete(id) })
+  }
   const addFiles = (files: File[]) => {
     setControlError('')
     for (const file of files) {
       const id = attachmentId(file)
+      attachmentFilesRef.current.set(id, file)
       setAttachments(items => items.some(item => item.id === id) ? items : [...items, { id, name: file.name, size: file.size, status: 'uploading' }])
       void uploadAttachment(file, id)
     }
@@ -434,7 +452,7 @@ export function ChatView({ session, conversationLoading, messages, settledAssist
     if (uploading) { setControlError('Wait for the file upload to finish, then send it to Hermes.'); return }
     const ready = attachments.filter((item): item is PendingAttachment & { refText: string } => item.status === 'ready' && Boolean(item.refText))
     if (!draft.trim() && !ready.length) return
-    if (await submit(ready.map(item => ({ name: item.name, refText: item.refText })))) { setAttachments([]); setVoiceReview('') }
+    if (await submit(ready.map(item => ({ name: item.name, refText: item.refText })))) { setAttachments([]); attachmentFilesRef.current.clear(); retryingRef.current.clear(); setVoiceReview('') }
   }
   const editMessage = (text: string) => { setDraft(text); requestAnimationFrame(() => textareaRef.current?.focus()) }
 
@@ -475,7 +493,7 @@ export function ChatView({ session, conversationLoading, messages, settledAssist
     <footer className="chat-dock">
       {voiceState !== 'idle' ? <div className={`recording-composer ${voiceAutoSend ? 'voice-autosend' : ''}`}><button onClick={() => void finishVoice(true)} aria-label="Cancel voice input"><X size={18}/></button>{voiceAutoSend && <small className="voice-autosend-label">Auto-send</small>}<span><i/>0:{String(recordSeconds).padStart(2, '0')}</span><div className="voice-bars">{voiceState === 'processing' ? 'Transcribing your voice…' : voiceInterim || (voiceAutoSend ? 'Release to send' : 'Listening…')}</div><button className="composer-send" onClick={() => void finishVoice()} aria-label="Finish voice input"><ArrowUp size={16}/></button></div> : <div className={`ai-composer ${draggingFiles ? 'file-drop-active' : ''}`}>
         {draggingFiles && <div className="file-drop-hint"><Paperclip size={15}/><span>Drop files to send to Hermes</span></div>}
-        {!!attachments.length && <div className="attachment-list" aria-label="Attached files">{attachments.map(item => <div className={`attachment-chip ${item.status}`} key={item.id}><FileText size={15}/><span><b>{item.name}</b><small>{item.error || (item.status === 'uploading' ? 'Uploading to Hermes…' : formatFileSize(item.size))}</small></span>{item.status === 'uploading' ? <LoaderCircle className="attachment-spinner" size={14}/> : item.status === 'ready' ? <Check size={14}/> : <span className="attachment-failed">!</span>}<button type="button" onClick={() => setAttachments(items => items.filter(current => current.id !== item.id))} aria-label={`Remove ${item.name}`}><Trash2 size={13}/></button></div>)}</div>}
+        {!!attachments.length && <div className="attachment-list" aria-label="Attached files">{attachments.map(item => <div className={`attachment-chip ${item.status}`} key={item.id}><FileText size={15}/><span><b>{item.name}</b><small>{item.error || (item.status === 'uploading' ? 'Uploading to Hermes…' : formatFileSize(item.size))}</small></span>{item.status === 'uploading' ? <LoaderCircle className="attachment-spinner" size={14}/> : item.status === 'ready' ? <Check size={14}/> : <span className="attachment-failed">!</span>}{item.status === 'error' && <button type="button" className="attachment-retry" onClick={() => retryAttachment(item.id)} aria-label={`Retry ${item.name}`}>Retry</button>}<button type="button" onClick={() => removeAttachment(item.id)} aria-label={`Remove ${item.name}`}><Trash2 size={13}/></button></div>)}</div>}
         {voiceReview && <div className="voice-review" aria-label="Voice transcription ready to edit"><Mic size={15}/><span><b>Voice transcription</b><small>Edit before sending</small></span><button type="button" onClick={() => { setVoiceReview(''); setDraft('') }} aria-label="Discard voice transcription"><X size={14}/></button></div>}
         <textarea ref={textareaRef} value={draft} disabled={sending || voiceState !== 'idle'} rows={1} placeholder="Ask anything…  /commands" onChange={event => setDraft(event.target.value)} onKeyDown={handleComposerKeyDown}/>
         <div className="composer-toolbar">

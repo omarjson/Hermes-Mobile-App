@@ -12,3 +12,11 @@ export function attachmentSummary(text: string, attachments: AttachmentReference
   if (cleanText) return cleanText
   return attachments.map(item => `Attached: ${item.name}`).join('\n')
 }
+
+export function attachmentId(file: { name: string; size: number; lastModified: number }): string {
+  return `${file.name}:${file.size}:${file.lastModified}`
+}
+
+export function formatFileSize(size: number): string {
+  return size < 1024 * 1024 ? `${Math.max(1, Math.round(size / 1024))} KB` : `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
